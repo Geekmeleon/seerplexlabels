@@ -34,6 +34,11 @@ def db():
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('CREATE TABLE IF NOT EXISTS selections (request_id INTEGER PRIMARY KEY, labels TEXT NOT NULL, applied TEXT NOT NULL DEFAULT "", last_error TEXT NOT NULL DEFAULT "", updated_at TEXT NOT NULL)')
+    columns = {r[1] for r in conn.execute('PRAGMA table_info(selections)')}
+    for name in ('collection_name', 'collection_applied'):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE selections ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+    conn.commit()
     return conn
 
 
@@ -68,12 +73,13 @@ def selected(conn, request_id):
     return row
 
 
-def update_state(request_id, applied=None, error=None):
+def update_state(request_id, applied=None, error=None, collection_applied=None):
     with lock, db() as conn:
         row = selected(conn, request_id)
         if row:
-            conn.execute('UPDATE selections SET applied=?, last_error=? WHERE request_id=?',
-                         (row['applied'] if applied is None else applied, row['last_error'] if error is None else error, request_id))
+            conn.execute('UPDATE selections SET applied=?, last_error=?, collection_applied=? WHERE request_id=?',
+                         (row['applied'] if applied is None else applied, row['last_error'] if error is None else error,
+                          row['collection_applied'] if collection_applied is None else collection_applied, request_id))
 
 
 def find_plex_item(plex, media, kind):
@@ -100,10 +106,52 @@ def find_plex_item(plex, media, kind):
     return None
 
 
+def apply_collection(item, name, labels):
+    section = item.section()
+    matches = [c for c in section.collections() if c.title.casefold() == name.casefold()]
+    if len(matches) > 1:
+        raise ValueError('Multiple Plex collections have this name; rename the duplicates in Plex first.')
+    if matches:
+        collection = matches[0]
+        if collection.smart:
+            raise ValueError('Selected Plex collection is smart; choose a regular collection instead.')
+        item.addCollection(collection.title)
+    else:
+        collection = section.createCollection(title=name, items=[item])
+    missing = set(labels) - {label.tag for label in collection.labels}
+    if missing:
+        collection.addLabel(sorted(missing))
+    item.reload()
+    collection.reload()
+    if collection.title not in {tag.tag for tag in item.collections}:
+        raise RuntimeError('Plex did not confirm collection membership')
+    if not set(labels).issubset({label.tag for label in collection.labels}):
+        raise RuntimeError('Plex did not confirm collection labels')
+
+
+def collection_context(entries):
+    plex = PlexServer(PLEX_URL, PLEX_TOKEN)
+    found = {}
+    presets = set()
+    existing_titles = []
+    for entry in entries:
+        item = find_plex_item(plex, entry['media_info'], 'movie')
+        if item is None:
+            continue
+        existing_titles.append(item.title)
+        preset = tuple(sorted(label.tag for label in item.labels))
+        presets.add(preset)
+        for tag in item.collections:
+            collection = item.section().collection(tag.tag)
+            if not collection.smart:
+                found[collection.title] = collection.title
+    return {'names': sorted(found), 'presets': sorted(presets), 'existing_titles': existing_titles}
+
+
 def reconcile():
     reqs = requests_list()
     with lock, db() as conn:
-        choices = {r['request_id']: r for r in conn.execute('SELECT * FROM selections WHERE labels != ""')}
+        choices = {r['request_id']: r for r in conn.execute('SELECT * FROM selections WHERE labels != "" OR collection_name != ""')}
     if not choices:
         return
     plex = PlexServer(PLEX_URL, PLEX_TOKEN)
@@ -112,8 +160,8 @@ def reconcile():
         row = choices.get(rid)
         if not row:
             continue
-        wanted = set(row['labels'].split(','))
-        if wanted.issubset(set(filter(None, row['applied'].split(',')))):
+        wanted = set(filter(None, row['labels'].split(',')))
+        if wanted.issubset(set(filter(None, row['applied'].split(',')))) and row['collection_name'] == row['collection_applied']:
             continue
         try:
             media = req.get('media') or {}
@@ -131,7 +179,9 @@ def reconcile():
                 item.reload()
             if not wanted.issubset({label.tag for label in item.labels}):
                 raise RuntimeError('Plex did not confirm all labels')
-            update_state(rid, applied=','.join(sorted(wanted)), error='')
+            if row['collection_name']:
+                apply_collection(item, row['collection_name'], wanted)
+            update_state(rid, applied=','.join(sorted(wanted)), error='', collection_applied=row['collection_name'])
         except Exception as exc:
             log.exception('Request %s: label update failed', rid)
             update_state(rid, error=str(exc)[:250])
@@ -243,6 +293,7 @@ def index():
             row = choices.get(req['id'], {})
             entries.append({'id': req['id'], 'title': details.get('title') or details.get('name') or f'{kind} · TMDB {mid}',
                             'kind': kind, 'selected': set(filter(None, row.get('labels', '').split(','))),
+                            'collection_name': row.get('collection_name', ''), 'collection_applied': row.get('collection_applied', ''),
                             'applied': row.get('applied', ''), 'error': row.get('last_error', ''),
                             'plex_labels': plex_labels.read(media, kind),
                             'date': str(req.get('createdAt', ''))[:10]})
@@ -411,15 +462,33 @@ def collection_request(collection_id):
                                        plex_reader.read(info, 'movie'))
             entries.append({'id': mid, 'title': details.get('title') or part.get('title'),
                             'date': details.get('releaseDate') or '', 'badges': badges,
-                            'blocked': bool(badges)})
+                            'blocked': bool(badges), 'media_info': info})
     except requests.RequestException as exc:
         return render_template('collection.html', collection={}, entries=[], labels=LABELS,
                                outcomes=[], error=f'Could not load collection status: {exc}'), 503
     entries.sort(key=lambda entry: (entry['date'] or '9999', entry['id']))
+    try:
+        context = collection_context(entries)
+    except Exception:
+        log.exception('Could not inspect Plex collections')
+        return render_template('collection.html', collection=collection, entries=entries, labels=LABELS, outcomes=[],
+                               error='Could not inspect Plex collections. Check the Plex connection before requesting.', context={}, collection_unavailable=True), 503
     if request.method == 'POST':
         values = request.form.getlist('movie')
+        collection_name = request.form.get('collection_name', '').strip()
+        if not collection_name or len(collection_name) > 150:
+            return render_template('collection.html', collection=collection, entries=entries, labels=LABELS, outcomes=[], context=context, error='Enter or choose a collection name (1–150 characters).'), 400
+        preset = request.form.get('label_preset', 'custom')
         choices = request.form.getlist('label')
-        if set(choices) - set(LABELS) or any(not value.isdecimal() for value in values):
+        if preset != 'custom':
+            try:
+                index = int(preset)
+                if index < 0:
+                    abort(400)
+                choices = list(context['presets'][index])
+            except (ValueError, IndexError):
+                abort(400)
+        if preset == 'custom' and set(choices) - set(LABELS) or any(not value.isdecimal() for value in values):
             abort(400)
         ids = set(map(int, values))
         if not ids.issubset({entry['id'] for entry in entries}):
@@ -452,15 +521,15 @@ def collection_request(collection_id):
                 continue
             try:
                 with lock, db() as conn:
-                    conn.execute('INSERT INTO selections(request_id, labels, applied, last_error, updated_at) VALUES(?,?,?,?,?) '
+                    conn.execute('INSERT INTO selections(request_id, labels, applied, last_error, updated_at, collection_name) VALUES(?,?,?,?,?,?) '
                                  'ON CONFLICT(request_id) DO NOTHING',
-                                 (rid, ','.join(label for label in LABELS if label in choices), '', '', datetime.now(timezone.utc).isoformat()))
+                                 (rid, ','.join(sorted(choices)), '', '', datetime.now(timezone.utc).isoformat(), collection_name))
                 outcomes.append(f'{entry["title"]}: request #{rid} created; selected labels saved.')
             except sqlite3.Error:
                 log.exception('Collection request %s created but labels were not saved', rid)
                 outcomes.append(f'{entry["title"]}: request #{rid} created, but labels could not be saved. Use Existing requests.')
     return render_template('collection.html', collection=collection, entries=entries, labels=LABELS,
-                           outcomes=outcomes, error=error)
+                           outcomes=outcomes, error=error, context=context)
 
 
 @app.post('/request/<int:rid>')

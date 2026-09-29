@@ -1,0 +1,19 @@
+services:
+  plex-label-manager:
+    image: ghcr.io/REPLACE_WITH_OWNER/plex-label-manager:latest
+    restart: unless-stopped
+    environment:
+      SEERR_URL: ${SEERR_URL}
+      SEERR_API_KEY: ${SEERR_API_KEY}
+      PLEX_URL: ${PLEX_URL}
+      PLEX_TOKEN: ${PLEX_TOKEN}
+      APP_PASSWORD: ${APP_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      POLL_SECONDS: '120'
+    ports:
+      - '127.0.0.1:8088:8080'
+    volumes:
+      - label_data:/data
+    # If using Seerr/Plex service names, join their existing external network here.
+volumes:
+  label_data:
