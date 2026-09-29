@@ -28,4 +28,11 @@ Use **Request with labels** at the top of the app. Search a title, open a movie 
 
 This page uses Seerr's configured default Radarr/Sonarr server and quality settings. It does not yet present Seerr's optional server, profile, root folder, and 4K choices. Use Seerr's own request dialog for those choices and then label the item from **Existing requests**. A rejected or already existing request is not relabeled by the new request form; use **Existing requests** for that.
 
-To update an existing GitHub repository, replace `app.py`, `Dockerfile`, `README.md`, and `templates/index.html`; add `templates/request_search.html` and `templates/request_detail.html`. Keep the existing `label_data` volume and Portainer secrets. After GitHub Actions publishes the new image, update the Portainer Stack with **Pull latest image** and recreate the container. If a bind mount is used for `/data`, it must remain writable by UID 10001.
+To update an existing GitHub repository, replace `app.py`, `Dockerfile`, `README.md`, and `index.html`; add `request_search.html` and `request_detail.html`. Keep the existing `label_data` volume and Portainer secrets. After GitHub Actions publishes the new image, update the Portainer Stack with **Pull latest image** and recreate the container. If a bind mount is used for `/data`, it must remain writable by UID 10001.
+
+
+## Flat application files and collection requests
+
+All HTML files now live beside app.py at the repository root. Dockerfile copies root HTML files, and Flask reads templates from that location. The old templates folder can be deleted once after uploading this version. Keep the existing .github/workflows/publish.yml in its required location; it does not need to be changed for routine app updates. The update ZIP contains flat root files and deliberately excludes the workflow and Compose configuration, preserving your current image address, environment, and mount settings.
+
+Movie details include a collection link when Seerr supplies one. Open it to review and request missing movies with the same optional Plex labels. Existing requests and Plex availability are rechecked before submission and skipped. Each selected missing movie creates a separate Seerr request; each outcome is reported. Labels apply only to newly submitted movies. A collection submission can partially succeed; review the outcomes before retrying. TV uses season selection rather than movie collections.

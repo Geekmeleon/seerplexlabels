@@ -21,7 +21,7 @@ SECRET = os.environ.get('SESSION_SECRET', '')
 DB_PATH = os.environ.get('DB_PATH', '/data/labels.sqlite3')
 POLL_SECONDS = max(30, int(os.environ.get('POLL_SECONDS', '120')))
 PAGE_SIZE = 100
-app = Flask(__name__)
+app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent))
 app.secret_key = SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict')
 log = logging.getLogger(__name__)
@@ -230,7 +230,10 @@ def new_request():
     error = None
     if query:
         try:
-            response = seerr_get('search', {'query': query, 'page': 1})
+            # Match the plus-separated search accepted by Seerr while keeping
+            # the user's normal title text in the search box.
+            search_query = '+'.join(query.split())
+            response = seerr_get('search', {'query': search_query, 'page': 1})
             existing = requests_list()
             for item in response.get('results', []):
                 if item.get('mediaType') in ('movie', 'tv') and isinstance(item.get('id'), int):
@@ -307,6 +310,70 @@ def request_detail(kind, media_id):
                         return redirect(url_for('index', created=rid))
     return render_template('request_detail.html', details=details, kind=kind, media_id=media_id,
                            seasons=seasons, labels=LABELS, error=error), 400 if error else 200
+
+
+@app.route('/collection/<int:collection_id>', methods=['GET', 'POST'])
+def collection_request(collection_id):
+    entries, outcomes, error = [], [], None
+    try:
+        collection = seerr_get(f'collection/{collection_id}')
+        existing = requests_list()
+        for part in collection.get('parts', []):
+            mid = part.get('id')
+            if not isinstance(mid, int):
+                continue
+            details = seerr_get(f'movie/{mid}')
+            badges = media_badges(details.get('mediaInfo'), matching_requests(existing, 'movie', mid))
+            entries.append({'id': mid, 'title': details.get('title') or part.get('title'),
+                            'date': details.get('releaseDate') or '', 'badges': badges,
+                            'blocked': bool(badges)})
+    except requests.RequestException as exc:
+        return render_template('collection.html', collection={}, entries=[], labels=LABELS,
+                               outcomes=[], error=f'Could not load collection status: {exc}'), 503
+    entries.sort(key=lambda entry: (entry['date'] or '9999', entry['id']))
+    if request.method == 'POST':
+        values = request.form.getlist('movie')
+        choices = request.form.getlist('label')
+        if set(choices) - set(LABELS) or any(not value.isdecimal() for value in values):
+            abort(400)
+        ids = set(map(int, values))
+        if not ids.issubset({entry['id'] for entry in entries}):
+            abort(400)
+        if not ids:
+            error = 'Select at least one missing movie.'
+        for entry in entries:
+            if entry['id'] not in ids:
+                continue
+            if entry['blocked']:
+                outcomes.append(f'{entry["title"]}: skipped — already requested or in Plex.')
+                continue
+            # Recheck immediately before submission, including requests made in another tab.
+            try:
+                fresh = seerr_get(f'movie/{entry["id"]}')
+                if media_badges(fresh.get('mediaInfo'), matching_requests(requests_list(), 'movie', entry['id'])):
+                    entry['blocked'] = True
+                    outcomes.append(f'{entry["title"]}: skipped — status changed.')
+                    continue
+                created = seerr_post('request', {'mediaType': 'movie', 'mediaId': entry['id']})
+            except requests.RequestException as exc:
+                outcomes.append(f'{entry["title"]}: could not confirm request; check Seerr before retrying. {exc}')
+                continue
+            rid = created.get('id')
+            entry['blocked'] = True
+            if not isinstance(rid, int):
+                outcomes.append(f'{entry["title"]}: submitted, but no request ID returned. Save labels on Existing requests.')
+                continue
+            try:
+                with lock, db() as conn:
+                    conn.execute('INSERT INTO selections(request_id, labels, applied, last_error, updated_at) VALUES(?,?,?,?,?) '
+                                 'ON CONFLICT(request_id) DO NOTHING',
+                                 (rid, ','.join(label for label in LABELS if label in choices), '', '', datetime.now(timezone.utc).isoformat()))
+                outcomes.append(f'{entry["title"]}: request #{rid} created; selected labels saved.')
+            except sqlite3.Error:
+                log.exception('Collection request %s created but labels were not saved', rid)
+                outcomes.append(f'{entry["title"]}: request #{rid} created, but labels could not be saved. Use Existing requests.')
+    return render_template('collection.html', collection=collection, entries=entries, labels=LABELS,
+                           outcomes=outcomes, error=error)
 
 
 @app.post('/request/<int:rid>')

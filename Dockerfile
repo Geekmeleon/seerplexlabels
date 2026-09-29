@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd -u 10001 -r appuser \
     && mkdir -p /data
 COPY app.py .
-COPY templates ./templates
+COPY *.html ./
 EXPOSE 8080
 CMD ["sh", "-c", "chown -R appuser:appuser /data && exec gosu appuser python /app/app.py"]
