@@ -127,6 +127,39 @@ def apply_collection(item, name, labels):
         raise RuntimeError('Plex did not confirm collection membership')
     if not set(labels).issubset({label.tag for label in collection.labels}):
         raise RuntimeError('Plex did not confirm collection labels')
+    return collection
+
+
+def organize_existing_collection(entries, name, labels, poster_path=None):
+    plex = PlexServer(PLEX_URL, PLEX_TOKEN)
+    outcomes, touched = [], {}
+    for entry in entries:
+        try:
+            item = find_plex_item(plex, entry['media_info'], 'movie')
+            if item is None:
+                continue
+            collection = apply_collection(item, name, labels)
+            touched[str(collection.ratingKey)] = collection
+            outcomes.append(f'{entry["title"]}: added to Plex collection. Existing movie labels preserved.')
+        except Exception as exc:
+            log.exception('Could not organize existing movie %s', entry['id'])
+            outcomes.append(f'{entry["title"]}: collection update failed: {exc}')
+    if not touched:
+        outcomes.append('No collection was updated. Check that these movies are matched in Plex.')
+    elif poster_path:
+        if not poster_path.startswith('/') or '..' in poster_path:
+            outcomes.append('Collection poster path was invalid; artwork was not changed.')
+        else:
+            for collection in touched.values():
+                try:
+                    collection.uploadPoster(url='https://image.tmdb.org/t/p/original' + poster_path)
+                    outcomes.append(f'{collection.title}: collection poster uploaded.')
+                except Exception as exc:
+                    log.exception('Could not upload collection poster')
+                    outcomes.append(f'{collection.title}: movies organized, but poster upload failed: {exc}')
+    else:
+        outcomes.append('Collection artwork unchanged; no poster was selected or available.')
+    return outcomes
 
 
 def collection_context(entries):
@@ -354,6 +387,8 @@ def search_entry(item, existing):
 @app.get('/request')
 def new_request():
     query = request.args.get('q', '').strip()[:120]
+    if query:
+        session['last_search_query'] = query
     results = []
     error = None
     if query:
@@ -490,6 +525,18 @@ def collection_request(collection_id):
                 abort(400)
         if preset == 'custom' and set(choices) - set(LABELS) or any(not value.isdecimal() for value in values):
             abort(400)
+        action = request.form.get('action', 'request')
+        if action not in ('request', 'organize'):
+            abort(400)
+        if action == 'organize':
+            try:
+                outcomes = organize_existing_collection(entries, collection_name, choices,
+                             collection.get('posterPath') if request.form.get('upload_poster') == 'yes' else None)
+            except Exception as exc:
+                log.exception('Existing collection organization failed')
+                error = f'Plex collection update failed: {exc}'
+            return render_template('collection.html', collection=collection, entries=entries, labels=LABELS,
+                                   outcomes=outcomes, error=error, context=context)
         ids = set(map(int, values))
         if not ids.issubset({entry['id'] for entry in entries}):
             abort(400)
