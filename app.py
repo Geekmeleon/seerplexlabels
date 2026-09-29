@@ -579,6 +579,123 @@ def collection_request(collection_id):
                            outcomes=outcomes, error=error, context=context)
 
 
+# Scan/apply work runs outside web requests so large libraries do not time out.
+collections_state = {'running': False, 'processed': 0, 'total': 0, 'groups': {}, 'messages': []}
+collections_lock = threading.RLock()
+
+
+def scan_collections():
+    groups, cache, messages = {}, {}, []
+    try:
+        plex = PlexServer(PLEX_URL, PLEX_TOKEN)
+        movies = [item for section in plex.library.sections() if section.type == 'movie'
+                  for item in section.all(includeGuids=True)]
+        with collections_lock:
+            collections_state['total'] = len(movies)
+        for index, item in enumerate(movies, 1):
+            try:
+                ids = [str(g.id).split('://', 1)[1] for g in item.guids if str(g.id).startswith('tmdb://')]
+                if not ids or not ids[0].isdecimal():
+                    messages.append(f'{item.title}: skipped; no TMDB movie ID in Plex.')
+                    continue
+                mid = int(ids[0])
+                if mid not in cache:
+                    cache[mid] = seerr_get(f'movie/{mid}')
+                membership = cache[mid].get('collection') or {}
+                cid = membership.get('id')
+                if not isinstance(cid, int):
+                    continue
+                group = groups.setdefault(cid, {'id': cid, 'title': membership.get('name') or 'Movie collection',
+                                               'poster': membership.get('posterPath'), 'entries': [], 'names': set(), 'presets': set()})
+                group['entries'].append({'id': mid, 'title': item.title,
+                                         'media_info': {'tmdbId': mid, 'plexId': str(item.ratingKey)}})
+                group['names'].update(tag.tag for tag in item.collections)
+                group['presets'].add(tuple(sorted(label.tag for label in item.labels)))
+            except Exception as exc:
+                log.exception('Collection scan failed for %s', item.title)
+                messages.append(f'{item.title}: status could not be checked: {exc}')
+            finally:
+                with collections_lock:
+                    collections_state['processed'] = index
+        for group in groups.values():
+            group['names'] = sorted(group['names'])
+            group['presets'] = sorted(group['presets'])
+            group['review'] = len(group['names']) > 1 or len(group['presets']) > 1
+            group['suggested_name'] = group['names'][0] if len(group['names']) == 1 else group['title']
+            try:
+                group['poster'] = seerr_get(f'collection/{group["id"]}').get('posterPath') or group['poster']
+            except requests.RequestException:
+                messages.append(f'{group["title"]}: collection artwork could not be refreshed.')
+        with collections_lock:
+            collections_state['groups'] = groups
+            collections_state['messages'] = messages
+    except Exception as exc:
+        log.exception('Plex collection scan failed')
+        with collections_lock:
+            collections_state['messages'] = [f'Scan failed: {exc}']
+    finally:
+        with collections_lock:
+            collections_state['running'] = False
+
+
+def apply_scanned_collections(jobs, upload_poster):
+    messages = []
+    try:
+        for index, (group, name) in enumerate(jobs, 1):
+            try:
+                current = collection_context(group['entries'])
+                if current['presets'] != group['presets'] or current['names'] != group['names']:
+                    messages.append(f'{group["title"]}: skipped; Plex collections or labels changed since the scan. Scan again.')
+                    continue
+                labels = group['presets'][0] if group['presets'] else []
+                messages.extend(organize_existing_collection(group['entries'], name, labels,
+                                                             group['poster'] if upload_poster else None))
+            except Exception as exc:
+                log.exception('Collection update failed')
+                messages.append(f'{group["title"]}: update failed: {exc}')
+            with collections_lock:
+                collections_state['processed'] = index
+    finally:
+        with collections_lock:
+            collections_state['messages'] = messages
+            collections_state['running'] = False
+
+
+@app.route('/collections', methods=['GET', 'POST'])
+def collections_page():
+    error = None
+    if request.method == 'POST':
+        with collections_lock:
+            if collections_state['running']:
+                error = 'A collection scan or update is already running.'
+            elif request.form.get('action') == 'scan':
+                collections_state.update(running=True, processed=0, total=0, messages=[], groups={})
+                threading.Thread(target=scan_collections, daemon=True).start()
+            elif request.form.get('action') == 'apply':
+                values = request.form.getlist('collection')
+                if not values or any(not value.isdecimal() for value in values):
+                    error = 'Select at least one collection.'
+                else:
+                    jobs = []
+                    for cid in set(map(int, values)):
+                        group = collections_state['groups'].get(cid)
+                        name = request.form.get(f'name_{cid}', '').strip()
+                        if not group or group['review'] or not name or len(name) > 150:
+                            error = 'Review conflicting groups and provide a valid name for each selected collection.'
+                            break
+                        jobs.append((group, name))
+                    if not error:
+                        collections_state.update(running=True, processed=0, total=len(jobs), messages=[])
+                        threading.Thread(target=apply_scanned_collections,
+                                         args=(jobs, request.form.get('upload_poster') == 'yes'), daemon=True).start()
+            else:
+                abort(400)
+    with collections_lock:
+        state = dict(collections_state)
+        groups = sorted(state['groups'].values(), key=lambda g: g['title'].casefold())
+    return render_template('collections.html', state=state, groups=groups, error=error)
+
+
 @app.post('/request/<int:rid>')
 def save(rid):
     values = request.form.getlist('label')
