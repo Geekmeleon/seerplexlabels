@@ -207,7 +207,7 @@ class PlexLabelReader:
                     for section in self.plex.library.sections():
                         if section.type not in ('movie', 'show'):
                             continue
-                        for item in section.all():
+                        for item in section.all(includeGuids=True):
                             for guid in item.guids:
                                 self.guid_index.setdefault((item.type, str(guid.id).lower()), []).append(item)
                 for field, prefix in (('tmdbId', 'tmdb'), ('tvdbId', 'tvdb')):
@@ -272,6 +272,15 @@ def matching_requests(reqs, kind, media_id):
             and (r.get('media') or {}).get('tmdbId') == media_id]
 
 
+def plex_status_badges(badges, snapshot):
+    badges = list(badges)
+    if snapshot['state'] == 'matched' and not any(b['style'] == 'available' for b in badges):
+        badges.append({'text': '✓ In Plex (verified)', 'style': 'available'})
+    elif snapshot['state'] == 'unavailable':
+        badges.append({'text': '? Plex status unavailable', 'style': 'requested'})
+    return badges
+
+
 def search_entry(item, existing):
     kind, mid = item['mediaType'], item['id']
     previous = matching_requests(existing, kind, mid)
@@ -288,7 +297,7 @@ def search_entry(item, existing):
     return {'id': mid, 'kind': kind,
             'title': item.get('title') or item.get('name') or 'Untitled',
             'date': (item.get('releaseDate') or item.get('firstAirDate') or '')[:4],
-            'badges': badges}
+            'badges': badges, 'media_info': dict(info, tmdbId=mid)}
 
 
 @app.get('/request')
@@ -307,6 +316,10 @@ def new_request():
                      if item.get('mediaType') in ('movie', 'tv') and isinstance(item.get('id'), int)]
             with ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(pool.map(lambda item: search_entry(item, existing), items))
+            plex_reader = PlexLabelReader()
+            for result in results:
+                snapshot = plex_reader.read(result.pop('media_info'), result['kind'])
+                result['badges'] = plex_status_badges(result['badges'], snapshot)
         except requests.RequestException as exc:
             error = f'Seerr search failed: {exc}'
     return render_template('request_search.html', query=query, results=results, error=error)
@@ -330,7 +343,7 @@ def request_detail(kind, media_id):
     seasons = sorted({s['seasonNumber'] for s in details.get('seasons', [])
                       if isinstance(s.get('seasonNumber'), int) and s['seasonNumber'] > 0}) if kind == 'tv' else []
     error = None
-    badges = media_badges(details.get('mediaInfo'), previous)
+    badges = plex_status_badges(media_badges(details.get('mediaInfo'), previous), details['currentPlexLabels'])
     if badges:
         return render_template('request_detail.html', details=details, kind=kind, media_id=media_id,
                                seasons=seasons, labels=LABELS, badges=badges, blocked=True,
@@ -387,12 +400,15 @@ def collection_request(collection_id):
     try:
         collection = seerr_get(f'collection/{collection_id}')
         existing = requests_list()
+        plex_reader = PlexLabelReader()
         for part in collection.get('parts', []):
             mid = part.get('id')
             if not isinstance(mid, int):
                 continue
             details = seerr_get(f'movie/{mid}')
-            badges = media_badges(details.get('mediaInfo'), matching_requests(existing, 'movie', mid))
+            info = dict(details.get('mediaInfo') or {}, tmdbId=mid)
+            badges = plex_status_badges(media_badges(info, matching_requests(existing, 'movie', mid)),
+                                       plex_reader.read(info, 'movie'))
             entries.append({'id': mid, 'title': details.get('title') or part.get('title'),
                             'date': details.get('releaseDate') or '', 'badges': badges,
                             'blocked': bool(badges)})
@@ -419,7 +435,9 @@ def collection_request(collection_id):
             # Recheck immediately before submission, including requests made in another tab.
             try:
                 fresh = seerr_get(f'movie/{entry["id"]}')
-                if media_badges(fresh.get('mediaInfo'), matching_requests(requests_list(), 'movie', entry['id'])):
+                fresh_info = dict(fresh.get('mediaInfo') or {}, tmdbId=entry['id'])
+                if plex_status_badges(media_badges(fresh_info, matching_requests(requests_list(), 'movie', entry['id'])),
+                                      PlexLabelReader().read(fresh_info, 'movie')):
                     entry['blocked'] = True
                     outcomes.append(f'{entry["title"]}: skipped — status changed.')
                     continue
