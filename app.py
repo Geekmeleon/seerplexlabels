@@ -42,6 +42,13 @@ def seerr_get(path, params=None):
     return response.json()
 
 
+def seerr_post(path, payload):
+    response = requests.post(f'{SEERR_URL}/api/v1/{path.lstrip("/")}',
+                             headers={'X-Api-Key': API_KEY}, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
 def requests_list():
     output = []
     skip = 0
@@ -193,6 +200,84 @@ def index():
         return render_template('index.html', entries=entries, labels=LABELS)
     except requests.RequestException as exc:
         return render_template('index.html', entries=[], labels=LABELS, error=f'Seerr connection failed: {exc}'), 503
+
+
+@app.get('/request')
+def new_request():
+    query = request.args.get('q', '').strip()[:120]
+    results = []
+    error = None
+    if query:
+        try:
+            response = seerr_get('search', {'query': query, 'page': 1})
+            for item in response.get('results', []):
+                if item.get('mediaType') in ('movie', 'tv') and isinstance(item.get('id'), int):
+                    results.append({'id': item['id'], 'kind': item['mediaType'],
+                                    'title': item.get('title') or item.get('name') or 'Untitled',
+                                    'date': (item.get('releaseDate') or item.get('firstAirDate') or '')[:4]})
+        except requests.RequestException as exc:
+            error = f'Seerr search failed: {exc}'
+    return render_template('request_search.html', query=query, results=results, error=error)
+
+
+@app.route('/request/<kind>/<int:media_id>', methods=['GET', 'POST'])
+def request_detail(kind, media_id):
+    if kind not in ('movie', 'tv') or media_id <= 0:
+        abort(404)
+    try:
+        details = seerr_get(f'{kind}/{media_id}')
+    except requests.RequestException as exc:
+        return render_template('request_detail.html', error=f'Could not load Seerr details: {exc}',
+                               details={}, kind=kind, media_id=media_id, labels=LABELS, seasons=[]), 503
+    if details.get('id') != media_id:
+        abort(404)
+    seasons = sorted({s['seasonNumber'] for s in details.get('seasons', [])
+                      if isinstance(s.get('seasonNumber'), int) and s['seasonNumber'] > 0}) if kind == 'tv' else []
+    error = None
+    if request.method == 'POST':
+        choices = request.form.getlist('label')
+        if len(choices) != len(set(choices)) or set(choices) - set(LABELS):
+            abort(400)
+        payload = {'mediaType': kind, 'mediaId': media_id}
+        if kind == 'tv':
+            chosen = request.form.getlist('season')
+            if not chosen or any(not value.isdecimal() for value in chosen):
+                error = 'Select at least one season.'
+            elif not set(map(int, chosen)).issubset(set(seasons)):
+                abort(400)
+            else:
+                payload['seasons'] = sorted(set(map(int, chosen)))
+        if not error:
+            try:
+                created = seerr_post('request', payload)
+            except requests.HTTPError as exc:
+                body = {}
+                if exc.response is not None and 'json' in exc.response.headers.get('Content-Type', ''):
+                    try:
+                        body = exc.response.json()
+                    except ValueError:
+                        pass
+                error = (body.get('message') if isinstance(body, dict) else None) or f'Seerr rejected the request: {exc}'
+            except requests.RequestException as exc:
+                error = f'Could not confirm the Seerr request. Check Seerr before trying again: {exc}'
+            else:
+                rid = created.get('id')
+                if not isinstance(rid, int):
+                    error = 'Seerr accepted the request, but did not return an ID. Find it on Existing requests and save its labels there.'
+                else:
+                    chosen_labels = ','.join(label for label in LABELS if label in choices)
+                    try:
+                        with lock, db() as conn:
+                            conn.execute('INSERT INTO selections(request_id, labels, applied, last_error, updated_at) VALUES(?,?,?,?,?) '
+                                         'ON CONFLICT(request_id) DO UPDATE SET labels=excluded.labels, last_error="", updated_at=excluded.updated_at',
+                                         (rid, chosen_labels, '', '', datetime.now(timezone.utc).isoformat()))
+                    except sqlite3.Error:
+                        log.exception('Request %s created but labels could not be saved', rid)
+                        error = f'Seerr request #{rid} was created, but labels could not be saved. Open Existing requests and save its labels there.'
+                    else:
+                        return redirect(url_for('index', created=rid))
+    return render_template('request_detail.html', details=details, kind=kind, media_id=media_id,
+                           seasons=seasons, labels=LABELS, error=error), 400 if error else 200
 
 
 @app.post('/request/<int:rid>')

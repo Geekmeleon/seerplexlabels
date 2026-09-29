@@ -21,3 +21,11 @@ Each push to `main` publishes a new image. Portainer or your existing image upda
 ## Local build alternative
 
 Use `.env.example` as a template for a private `.env`, then run `docker compose up -d --build` on the Docker host. This uses `compose.yaml` and builds from the files in this folder.
+
+## Request and choose labels together
+
+Use **Request with labels** at the top of the app. Search a title, open a movie or show, choose seasons for TV, select any labels, then submit. The app posts the request to Seerr and saves labels against the returned request ID. No labels are selected by default. The existing requests page remains available to label a request submitted directly in Seerr.
+
+This page uses Seerr's configured default Radarr/Sonarr server and quality settings. It does not yet present Seerr's optional server, profile, root folder, and 4K choices. Use Seerr's own request dialog for those choices and then label the item from **Existing requests**. A rejected or already existing request is not relabeled by the new request form; use **Existing requests** for that.
+
+To update an existing GitHub repository, replace `app.py`, `Dockerfile`, `README.md`, and `templates/index.html`; add `templates/request_search.html` and `templates/request_detail.html`. Keep the existing `label_data` volume and Portainer secrets. After GitHub Actions publishes the new image, update the Portainer Stack with **Pull latest image** and recreate the container. If a bind mount is used for `/data`, it must remain writable by UID 10001.
