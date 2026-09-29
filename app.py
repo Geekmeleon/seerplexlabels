@@ -202,6 +202,27 @@ def index():
         return render_template('index.html', entries=[], labels=LABELS, error=f'Seerr connection failed: {exc}'), 503
 
 
+def media_badges(info, previous):
+    info = info or {}
+    badges = []
+    for field, suffix in (('status', ''), ('status4k', ' (4K)')):
+        status = info.get(field)
+        if status == 5:
+            badges.append({'text': '✓ In Plex' + suffix, 'style': 'available'})
+        elif status == 4:
+            badges.append({'text': '◐ Partly in Plex' + suffix, 'style': 'available'})
+        elif status in (2, 3):
+            badges.append({'text': '⌛ ' + ('Pending request' if status == 2 else 'Processing') + suffix, 'style': 'requested'})
+    if previous or info.get('requests'):
+        badges.append({'text': '↻ Existing request', 'style': 'requested'})
+    return badges
+
+
+def matching_requests(reqs, kind, media_id):
+    return [r for r in reqs if (r.get('type') or (r.get('media') or {}).get('mediaType')) == kind
+            and (r.get('media') or {}).get('tmdbId') == media_id]
+
+
 @app.get('/request')
 def new_request():
     query = request.args.get('q', '').strip()[:120]
@@ -210,11 +231,13 @@ def new_request():
     if query:
         try:
             response = seerr_get('search', {'query': query, 'page': 1})
+            existing = requests_list()
             for item in response.get('results', []):
                 if item.get('mediaType') in ('movie', 'tv') and isinstance(item.get('id'), int):
                     results.append({'id': item['id'], 'kind': item['mediaType'],
                                     'title': item.get('title') or item.get('name') or 'Untitled',
-                                    'date': (item.get('releaseDate') or item.get('firstAirDate') or '')[:4]})
+                                    'date': (item.get('releaseDate') or item.get('firstAirDate') or '')[:4],
+                                    'badges': media_badges(item.get('mediaInfo'), matching_requests(existing, item['mediaType'], item['id']))})
         except requests.RequestException as exc:
             error = f'Seerr search failed: {exc}'
     return render_template('request_search.html', query=query, results=results, error=error)
@@ -226,6 +249,7 @@ def request_detail(kind, media_id):
         abort(404)
     try:
         details = seerr_get(f'{kind}/{media_id}')
+        previous = matching_requests(requests_list(), kind, media_id)
     except requests.RequestException as exc:
         return render_template('request_detail.html', error=f'Could not load Seerr details: {exc}',
                                details={}, kind=kind, media_id=media_id, labels=LABELS, seasons=[]), 503
@@ -234,6 +258,11 @@ def request_detail(kind, media_id):
     seasons = sorted({s['seasonNumber'] for s in details.get('seasons', [])
                       if isinstance(s.get('seasonNumber'), int) and s['seasonNumber'] > 0}) if kind == 'tv' else []
     error = None
+    badges = media_badges(details.get('mediaInfo'), previous)
+    if badges:
+        return render_template('request_detail.html', details=details, kind=kind, media_id=media_id,
+                               seasons=seasons, labels=LABELS, badges=badges, blocked=True,
+                               error='This title already has a request or Plex availability. Review it in Seerr or Existing requests before making changes.'), 409 if request.method == 'POST' else 200
     if request.method == 'POST':
         choices = request.form.getlist('label')
         if len(choices) != len(set(choices)) or set(choices) - set(LABELS):
