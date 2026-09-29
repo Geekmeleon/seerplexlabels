@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -175,6 +176,52 @@ def health():
     return 'ok'
 
 
+class PlexLabelReader:
+    """One connection and at most one GUID index per page render; no edits."""
+    def __init__(self):
+        self.plex = None
+        self.guid_index = None
+        self.failed = False
+
+    def read(self, media, kind):
+        if self.failed:
+            return {'labels': [], 'state': 'unavailable'}
+        try:
+            if kind not in ('movie', 'tv'):
+                return {'labels': [], 'state': 'not_found'}
+            if self.plex is None:
+                self.plex = PlexServer(PLEX_URL, PLEX_TOKEN)
+            expected = 'movie' if kind == 'movie' else 'show'
+            items = {}
+            keys = {str(media.get(field)) for field in ('plexId', 'plexRatingKey', 'plexId4k', 'plexRatingKey4k') if media.get(field)}
+            for key in keys:
+                try:
+                    item = self.plex.fetchItem(int(key))
+                    if item.type == expected:
+                        items[str(item.ratingKey)] = item
+                except Exception:
+                    log.warning('Could not read Plex item %s for label display', key)
+            if not items:
+                if self.guid_index is None:
+                    self.guid_index = {}
+                    for section in self.plex.library.sections():
+                        if section.type not in ('movie', 'show'):
+                            continue
+                        for item in section.all():
+                            for guid in item.guids:
+                                self.guid_index.setdefault((item.type, str(guid.id).lower()), []).append(item)
+                for field, prefix in (('tmdbId', 'tmdb'), ('tvdbId', 'tvdb')):
+                    if media.get(field):
+                        for item in self.guid_index.get((expected, f'{prefix}://{media[field]}'), []):
+                            items[str(item.ratingKey)] = item
+            return {'labels': sorted({label.tag for item in items.values() for label in item.labels}),
+                    'state': 'matched' if items else 'not_found'}
+        except Exception:
+            self.failed = True
+            log.exception('Could not read current Plex labels')
+            return {'labels': [], 'state': 'unavailable'}
+
+
 @app.get('/')
 def index():
     try:
@@ -182,6 +229,7 @@ def index():
         with db() as conn:
             choices = {r['request_id']: dict(r) for r in conn.execute('SELECT * FROM selections')}
         entries = []
+        plex_labels = PlexLabelReader()
         for req in reqs:
             media = req.get('media') or {}
             kind = req.get('type') or media.get('mediaType')
@@ -196,6 +244,7 @@ def index():
             entries.append({'id': req['id'], 'title': details.get('title') or details.get('name') or f'{kind} · TMDB {mid}',
                             'kind': kind, 'selected': set(filter(None, row.get('labels', '').split(','))),
                             'applied': row.get('applied', ''), 'error': row.get('last_error', ''),
+                            'plex_labels': plex_labels.read(media, kind),
                             'date': str(req.get('createdAt', ''))[:10]})
         return render_template('index.html', entries=entries, labels=LABELS)
     except requests.RequestException as exc:
@@ -223,6 +272,25 @@ def matching_requests(reqs, kind, media_id):
             and (r.get('media') or {}).get('tmdbId') == media_id]
 
 
+def search_entry(item, existing):
+    kind, mid = item['mediaType'], item['id']
+    previous = matching_requests(existing, kind, mid)
+    # Search responses can omit mediaInfo even when the detail endpoint has it.
+    info = item.get('mediaInfo') or {}
+    try:
+        details = seerr_get(f'{kind}/{mid}')
+        info = details.get('mediaInfo') or info
+        badges = media_badges(info, previous)
+    except requests.RequestException:
+        log.warning('Could not verify search status for %s %s', kind, mid)
+        badges = media_badges(info, previous)
+        badges.append({'text': '? Status unavailable — open to check', 'style': 'requested'})
+    return {'id': mid, 'kind': kind,
+            'title': item.get('title') or item.get('name') or 'Untitled',
+            'date': (item.get('releaseDate') or item.get('firstAirDate') or '')[:4],
+            'badges': badges}
+
+
 @app.get('/request')
 def new_request():
     query = request.args.get('q', '').strip()[:120]
@@ -235,12 +303,10 @@ def new_request():
             search_query = '+'.join(query.split())
             response = seerr_get('search', {'query': search_query, 'page': 1})
             existing = requests_list()
-            for item in response.get('results', []):
-                if item.get('mediaType') in ('movie', 'tv') and isinstance(item.get('id'), int):
-                    results.append({'id': item['id'], 'kind': item['mediaType'],
-                                    'title': item.get('title') or item.get('name') or 'Untitled',
-                                    'date': (item.get('releaseDate') or item.get('firstAirDate') or '')[:4],
-                                    'badges': media_badges(item.get('mediaInfo'), matching_requests(existing, item['mediaType'], item['id']))})
+            items = [item for item in response.get('results', [])
+                     if item.get('mediaType') in ('movie', 'tv') and isinstance(item.get('id'), int)]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda item: search_entry(item, existing), items))
         except requests.RequestException as exc:
             error = f'Seerr search failed: {exc}'
     return render_template('request_search.html', query=query, results=results, error=error)
@@ -258,6 +324,9 @@ def request_detail(kind, media_id):
                                details={}, kind=kind, media_id=media_id, labels=LABELS, seasons=[]), 503
     if details.get('id') != media_id:
         abort(404)
+    info = dict(details.get('mediaInfo') or {})
+    info.setdefault('tmdbId', media_id)
+    details['currentPlexLabels'] = PlexLabelReader().read(info, kind)
     seasons = sorted({s['seasonNumber'] for s in details.get('seasons', [])
                       if isinstance(s.get('seasonNumber'), int) and s['seasonNumber'] > 0}) if kind == 'tv' else []
     error = None
